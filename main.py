@@ -15,9 +15,7 @@ from picard import config, log
 from picard.metadata import (register_album_metadata_processor, register_track_metadata_processor)
 from picard.plugin import PluginPriority
 
-
 file_to_write = os.path.join(config.setting["move_files_to"], "data_dump.txt")
-
 
 def Mbox(title, text, style):
     return ctypes.windll.user32.MessageBoxW(0, text, title, style)
