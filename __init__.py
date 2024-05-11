@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2023 Clayton Mattatall (DarkOverLordII)
+# Copyright (C) 2024 Giorgio Fontanive (twodoorcoupe)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -11,163 +11,449 @@
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-# 02110-1301, USA.
 
-PLUGIN_NAME = 'Tag Cleaner'
-PLUGIN_AUTHOR = 'Clayton Mattatall'
-PLUGIN_DESCRIPTION = '''
-This plugin gives users the ability to sanitize the metadata in
-individual files using bulk actions. All tags are scanned to 
-locate those that match the entries defined in the plugin's 
-configuration. If a match is found, the defined action is taken
-and the current tag. 
-<br /><br />
-When this plugin is installed, a settings page will be added 
-to Picard's options, which is where the plugin is configured.
-<br /><br />
-Please see the <a href="https://github.com/rdswift/picard-plugins/blob/2.0_RDS_Plugins/plugins/tag_cleaner/docs/README.md">user guide</a> on GitHub for more information.
-'''
-PLUGIN_VERSION = '0.1'
-PLUGIN_API_VERSIONS = ['2.0', '2.1', '2.2', '2.3', '2.6', '2.7', '2.8']
+PLUGIN_NAME = "Post Tagging Actions"
+PLUGIN_AUTHOR = "Giorgio Fontanive"
+PLUGIN_DESCRIPTION = """
+This plugin lets you set up actions that run with a context menu click. 
+An action consists in a command line executed for each album or each track along
+with a few options to tweak the behaviour. 
+This can be used to run external programs and pass some variables to it. 
+"""
+PLUGIN_VERSION = "0.1"
+PLUGIN_API_VERSIONS = ["2.10", "2.11"]
 PLUGIN_LICENSE = "GPL-2.0"
-PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.txt"
+PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
+PLUGIN_USER_GUIDE_URL = "https://github.com/metabrainz/picard-plugins/tree/2.0/plugins/post_tagging_actions/docs/guide.md"
 
+from picard.album import Album
+from picard.track import Track
+from picard.ui.options import OptionsPage, register_options_page
+from picard.ui.itemviews import BaseAction, register_album_action, register_track_action
+from picard.ui import mainwindow
+from picard import log, config
+from picard.const import sys
+from picard.util import thread
+from picard.script import parser
+
+from .options_post_tagging_actions import Ui_PostTaggingActions
+from .actions_status import Ui_ActionsStatus
+from PyQt5 import QtCore, QtWidgets, QtGui
+
+from collections import namedtuple
+from queue import PriorityQueue
+from threading import Thread, Lock
+from concurrent import futures
+from os import path, cpu_count
 import re
+import shlex
+import subprocess  # nosec B404
+import time
 
-from picard import (
-    config,
-    log,
-)
-from picard.metadata import (
-    MULTI_VALUED_JOINER,
-    register_track_metadata_processor,
-)
-from picard.plugin import PluginPriority
-from picard.plugins.tag_cleaner.ui_options_tag_cleaner import (
-    Ui_Tag_CleanerOptionsPage,
-)
+WIDGET_UPDATE_INTERVAL = 0.5
 
-from picard.ui.options import (
-    OptionsPage,
-    register_options_page,
-)
+# Additional special variables.
+TRACK_SPECIAL_VARIABLES = {
+    "filepath": lambda file: file,
+    "folderpath": lambda file: path.dirname(file),  # pylint: disable=unnecessary-lambda
+    "filename": lambda file: path.splitext(path.basename(file))[0],
+    "filename_ext": lambda file: path.basename(file),  # pylint: disable=unnecessary-lambda
+    "directory": lambda file: path.basename(path.dirname(file))
+}
+ALBUM_SPECIAL_VARIABLES = {
+    "get_num_matched_tracks",
+    "get_num_unmatched_files",
+    "get_num_total_files",
+    "get_num_unsaved_files",
+    "is_complete",
+    "is_modified"
+}
 
+# Settings.
+CANCEL = "pta_cancel"
+MAX_WORKERS = "pta_max_workers"
+OPTIONS = ("pta_command", "pta_wait_for_exit", "pta_execute_for_tracks", "pta_refresh_tags")
 
-pairs_split = re.compile(r"\r\n|\n\r|\n").split
-
-OPT_MATCH_ENABLED = 'tag_cleaner_enabled'
-OPT_MATCH_PAIRS = 'tag_cleaner_replacement_pairs'
-OPT_MATCH_FIRST = 'tag_cleaner_apply_first_match_only'
-OPT_MATCH_REGEX = 'tag_cleaner_use_regex'
-
-
-class TagCleaner():
-    pairs = []
-
-    @classmethod
-    def refresh(cls):
-        log.debug("%s: Refreshing the tags to sanitize.",
-            PLUGIN_NAME, 'RegEx' if config.Option.exists("setting", OPT_MATCH_REGEX) and config.setting[OPT_MATCH_REGEX] else 'Simple',)
-        if not config.Option.exists("setting", OPT_MATCH_PAIRS):
-            log.warning("%s: Unable to read the '%s' setting.", PLUGIN_NAME, OPT_MATCH_PAIRS,)
-            return
-
-        def _make_re(map_string):
-            # Replace period with temporary placeholder character (newline)
-            re_string = str(map_string).strip().replace('.', '\n')
-            # Convert wildcard characters to regular expression equivalents
-            re_string = re_string.replace('*', '.*').replace('?', '.')
-            # Escape carat and dollar sign for regular expression
-            re_string = re_string.replace('^', '\\^').replace('$', '\\$')
-            # Replace temporary placeholder characters with escaped periods
-            re_string = '^' + re_string.replace('\n', '\\.') + '$'
-            # Return regular expression with carat and dollar sign to force match condition on full string
-            return re_string
-
-        cls.pairs = []
-        for pair in pairs_split(config.setting[OPT_MATCH_PAIRS]):
-            if "=" not in pair:
-                continue
-            original, replacement = pair.split('=', 1)
-            original = original.strip()
-            if not original:
-                continue
-            replacement = replacement.strip()
-            cls.pairs.append((original if config.setting[OPT_MATCH_REGEX] else _make_re(original), replacement))
-            log.debug('%s: Add genre mapping pair: "%s" = "%s"', PLUGIN_NAME, original, replacement,)
-        if not cls.pairs:
-            log.debug("%s: No genre replacement maps defined.", PLUGIN_NAME,)
+Options = namedtuple("Options", ("variables", *[option[4:] for option in OPTIONS]))
+Action = namedtuple("Action", ("commands", "album", "options"))
+PriorityAction = namedtuple("PriorityAction", ("priority", "counter", "action"))
+action_queue = PriorityQueue()
+variables_pattern = re.compile(r'%.*?%')
 
 
-class TagCleanerOptionsPage(OptionsPage):
+class ActionLoader:
+    """Adds actions to the execution queue.
 
-    NAME = "tag_cleaner"
-    TITLE = "Tag Cleaner"
+    Attributes:
+        action_options (list): Stores the actions' information loaded from the options page.
+        action_counter (int): The count of actions that have been added to the queue, used for priority.
+    """
+
+    def __init__(self):
+        self.action_options = []
+        self.action_counter = 0
+        self.load_actions()
+
+    def _create_options(self, command, *other_options):
+        """Finds the variables in the command and adds the options to the action options list.
+        """
+        variables = [parser.normalize_tagname(variable[1:-1]) for variable in variables_pattern.findall(command)]
+        command = variables_pattern.sub('{}', command)
+        options = Options(variables, command, *other_options)
+        self.action_options.append(options)
+
+    def _create_action(self, priority, commands, album, options):
+        """Adds an action with the given parameters to the execution queue.
+
+        If the os is not windows, the command is split as suggested by the subprocess
+        module documentation.
+        """
+        if not sys.IS_WIN:
+            commands = [shlex.split(command) for command in commands]
+        action = Action(commands, album, options)
+        priority_action = PriorityAction(priority, self.action_counter, action)
+        action_queue.put(priority_action)
+        self.action_counter += 1
+
+    def _replace_variables(self, variables, item):
+        """Returns a list where each variable is replaced with its value.
+
+        Item is either an album or a track. For track special variables,
+        it uses the path of the first file of the given item.
+        If the variable is not found anywhere, it remains as in the original text.
+        """
+        values = []
+        album = item.album if isinstance(item, Track) else item
+        first_file_path = next(item.iterfiles()).filename
+        for variable in variables:
+            if variable in ALBUM_SPECIAL_VARIABLES:
+                values.append(getattr(album, variable)())
+            elif variable in TRACK_SPECIAL_VARIABLES:
+                values.append(TRACK_SPECIAL_VARIABLES[variable](first_file_path))
+            else:
+                values.append(item.metadata.get(variable, f"%{variable}%"))
+        return values
+
+    def add_actions(self, album, tracks):
+        """Adds one action to the execution queue for each tuple in the action options list.
+
+        Actions meant to be executed once for each track are considered as a single
+        action. This way, the other options are more consistent.
+        """
+        for priority, options in enumerate(self.action_options):
+            if options.execute_for_tracks:
+                values_list = [self._replace_variables(options.variables, track) for track in tracks]
+            else:
+                values_list = [self._replace_variables(options.variables, album)]
+            commands = [options.command.format(*values) for values in values_list]
+            self._create_action(priority, commands, album, options)
+
+    def load_actions(self):
+        """Loads the information from the options and saves it in the action options list.
+
+        This gets called when the plugin is loaded or when the user saves the options.
+        """
+        self.action_options = []
+        option_tuples = zip(*[config.setting[name] for name in OPTIONS])
+        for option_tuple in option_tuples:
+            command = option_tuple[0]
+            other_options = [eval(option) for option in option_tuple[1:]]  # nosec B307
+            self._create_options(command, *other_options)
+
+
+class ActionRunner:
+    """Runs actions in the execution queue.
+
+    Attributes:
+        action_thread_pool (ThreadPoolExecutor): Pool used to run processes with the subprocess module.
+        refresh_tags_pool (ThreadPoolExecutor): Pool used to reload tags from files and refresh albums.
+        worker (Thread): Worker thread that picks actions from the execution queue.
+        update_widget (Thread): Thread that updates the number of pending actions in the status bar.
+    """
+
+    def __init__(self):
+        self.action_thread_pool = futures.ThreadPoolExecutor(config.setting[MAX_WORKERS])
+        self.refresh_tags_pool = futures.ThreadPoolExecutor(1)
+        self.worker = Thread(target = self._execute)
+        self.update_widget = Thread(target = self._update_widget)
+        self.worker.start()
+
+        self.keep_updating = True
+        self.currently_executing = 0
+        self.currently_executing_lock = Lock()
+        self.status_widget = ActionsStatus()
+
+        # This is used to register functions that run when the application is being closed.
+        # The stop function makes the background threads return.
+        tagger = QtCore.QCoreApplication.instance()
+        tagger.register_cleanup(self.stop)
+
+        # This checks whether the tagger has already created the main window.
+        # It should happen only when the plugin is installed through the options menu,
+        # otherwise the plugins are loaded before the main window is created.
+        if hasattr(tagger, "window"):
+            self._create_widget(tagger.window)
+        else:
+            # This is used to register functions that run after the main window has finished loading.
+            mainwindow.register_ui_init(self._create_widget)
+
+    def _create_widget(self, window):
+        """Adds the pending actions widget to the right of the other icons in the statusbar.
+        """
+        window.statusBar().insertPermanentWidget(1, self.status_widget)
+        self.update_widget.start()
+
+    def _update_widget(self):
+        """Updates the number of pending actions in the status bar at regular intervals.
+        """
+        while self.keep_updating:
+            number_of_actions = action_queue.qsize() + self.currently_executing
+            thread.to_main(self.status_widget.update_actions_count, number_of_actions)
+            time.sleep(WIDGET_UPDATE_INTERVAL)
+
+    def _refresh_tags(self, future_objects, album):
+        """Reloads tags from the album's files and refreshes the album.
+
+        First, it makes sure that the action has finished running. This is used for
+        when an external process changes a file's tags.
+        """
+        futures.wait(future_objects, return_when = futures.ALL_COMPLETED)
+        for file in album.iterfiles():
+            file.set_pending()
+            file.load(lambda file: None)
+        thread.to_main(album.load, priority = True, refresh = True)
+
+    def _run_process(self, command):
+        """Runs the process and waits for it to finish.
+        """
+        process = subprocess.Popen(
+            command,
+            text = True,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE
+        )  # nosec B603
+        answer = process.communicate()
+        if answer[0]:
+            log.info("Action output:\n%s", answer[0])
+        if answer[1]:
+            log.error("Action error:\n%s", answer[1])
+
+    def _update_executing_count(self, future_objects):
+        """Decrements the count of executing actions once the given action finishes.
+        """
+        futures.wait(future_objects, return_when = futures.ALL_COMPLETED)
+        with self.currently_executing_lock:
+            self.currently_executing -= 1
+
+    def _execute(self):
+        """Takes actions from the execution queue and runs them.
+
+        If it finds an action with priority -1, the loop stops. When the loop
+        stops, both ThreadPoolExecutors are shutdown.
+        """
+        while True:
+            priority_action = action_queue.get()
+            if priority_action.priority == -1:
+                break
+            with self.currently_executing_lock:
+                self.currently_executing += 1
+            next_action = priority_action.action
+            commands = next_action.commands
+            future_objects = {self.action_thread_pool.submit(self._run_process, command) for command in commands}
+
+            if next_action.options.wait_for_exit:
+                futures.wait(future_objects, return_when = futures.ALL_COMPLETED)
+            if next_action.options.refresh_tags:
+                self.refresh_tags_pool.submit(self._refresh_tags, future_objects, next_action.album)
+            self.refresh_tags_pool.submit(self._update_executing_count, future_objects)
+            action_queue.task_done()
+
+        self.action_thread_pool.shutdown(wait = False, cancel_futures = True)
+        self.refresh_tags_pool.shutdown(wait = False, cancel_futures = True)
+
+    def stop(self):
+        """Makes the worker thread exit its loop.
+
+        This gets called when Picard is closed. It waits for the processes that
+        are still executing to finish before exiting.
+        """
+        if not config.setting[CANCEL]:
+            action_queue.join()
+        action_queue.put(PriorityAction(-1, -1, None))
+        self.keep_updating = False
+        if self.update_widget.is_alive():
+            self.update_widget.join()
+        self.worker.join()
+
+
+class ExecuteAlbumActions(BaseAction):
+
+    NAME = "Run actions for highlighted albums"
+
+    def callback(self, objs):
+        albums = {obj for obj in objs if isinstance(obj, Album)}
+        for album in albums:
+            action_loader.add_actions(album, album.tracks)
+
+
+class ExecuteTrackActions(BaseAction):
+
+    NAME = "Run actions for highlighted tracks"
+
+    def callback(self, objs):
+        tracks = {obj for obj in objs if isinstance(obj, Track)}
+        albums = {track.album for track in tracks}
+        for album in albums:
+            album_tracks = tracks.intersection(album.tracks)
+            action_loader.add_actions(album, album_tracks)
+
+
+class PostTaggingActionsOptions(OptionsPage):
+    """Options page found under the "plugins" page.
+    """
+
+    NAME = "post_tagging_actions"
+    TITLE = "Post Tagging Actions"
     PARENT = "plugins"
 
+    action_options = [config.ListOption("setting", name, []) for name in OPTIONS]
     options = [
-        config.TextOption("setting", OPT_MATCH_PAIRS, ''),
-        config.BoolOption("setting", OPT_MATCH_FIRST, False),
-        config.BoolOption("setting", OPT_MATCH_ENABLED, False),
-        config.BoolOption("setting", OPT_MATCH_REGEX, False),
+        config.BoolOption("setting", CANCEL, True),
+        config.IntOption("setting", MAX_WORKERS, min(32, cpu_count() + 4)),
+        *action_options
     ]
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.ui = Ui_Tag_CleanerOptionsPage()
+    def __init__(self, parent = None):
+        super(PostTaggingActionsOptions, self).__init__(parent)
+        self.ui = Ui_PostTaggingActions()
         self.ui.setupUi(self)
+        self._reset_ui()
+
+        header = self.ui.table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        for column in range(1, header.count()):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+
+        self.ui.add_file_path.clicked.connect(self._open_file_dialog)
+        self.ui.add_action.clicked.connect(self._add_action_to_table)
+        self.ui.remove_action.clicked.connect(self._remove_action_from_table)
+        self.ui.up.clicked.connect(self._move_action_up)
+        self.ui.down.clicked.connect(self._move_action_down)
+
+        self.get_table_columns_values = [
+            self.ui.action.text,
+            self.ui.wait.isChecked,
+            self.ui.tracks.isChecked,
+            self.ui.refresh.isChecked
+        ]
+
+    def _open_file_dialog(self):
+        """Adds the selected file's path to the command line text box.
+        """
+        file = QtWidgets.QFileDialog.getOpenFileName(self)[0]
+        cursor_position = self.ui.action.cursorPosition()
+        current_text = self.ui.action.text()
+        if not sys.IS_WIN:
+            file = shlex.quote(file)
+        new_text = current_text[:cursor_position] + file + current_text[cursor_position:]
+        self.ui.action.setText(new_text)
+
+    def _reset_ui(self):
+        self.ui.action.setText("")
+        self.ui.wait.setChecked(False)
+        self.ui.refresh.setChecked(False)
+        self.ui.albums.setChecked(True)
+
+    def _add_action_to_table(self):
+        if not self.ui.action.text():
+            return
+        row_position = self.ui.table.rowCount()
+        self.ui.table.insertRow(row_position)
+        for column in range(self.ui.table.columnCount()):
+            value = self.get_table_columns_values[column]()
+            value = str(value)
+            widget = QtWidgets.QTableWidgetItem(value)
+            self.ui.table.setItem(row_position, column, widget)
+        self._reset_ui()
+
+    def _remove_action_from_table(self):
+        current_row = self.ui.table.currentRow()
+        if current_row != -1:
+            self.ui.table.removeRow(current_row)
+
+    def _move_action_up(self):
+        current_row = self.ui.table.currentRow()
+        new_row = current_row - 1
+        if current_row > 0:
+            self._swap_table_rows(current_row, new_row)
+            self.ui.table.setCurrentCell(new_row, 0)
+
+    def _move_action_down(self):
+        current_row = self.ui.table.currentRow()
+        new_row = current_row + 1
+        if current_row < self.ui.table.rowCount() - 1:
+            self._swap_table_rows(current_row, new_row)
+            self.ui.table.setCurrentCell(new_row, 0)
+
+    def _swap_table_rows(self, row1, row2):
+        for column in range(self.ui.table.columnCount()):
+            item1 = self.ui.table.takeItem(row1, column)
+            item2 = self.ui.table.takeItem(row2, column)
+            self.ui.table.setItem(row1, column, item2)
+            self.ui.table.setItem(row2, column, item1)
 
     def load(self):
-        # Enable external link
-        self.ui.format_description.setOpenExternalLinks(True)
-
-        self.ui.tag_cleaner_replacement_pairs.setPlainText(config.setting[OPT_MATCH_PAIRS])
-        self.ui.tag_cleaner_first_match_only.setChecked(config.setting[OPT_MATCH_FIRST])
-        self.ui.cb_enable_tag_cleaner.setChecked(config.setting[OPT_MATCH_ENABLED])
-        self.ui.cb_use_regex.setChecked(config.setting[OPT_MATCH_REGEX])
-
-        self.ui.cb_enable_tag_cleaner.stateChanged.connect(self._set_enabled_state)
-        self._set_enabled_state()
+        """Puts the plugin's settings into the actions table.
+        """
+        settings = zip(*[config.setting[name] for name in OPTIONS])
+        for row, values in enumerate(settings):
+            self.ui.table.insertRow(row)
+            for column in range(self.ui.table.columnCount()):
+                widget = QtWidgets.QTableWidgetItem(values[column])
+                self.ui.table.setItem(row, column, widget)
+        self.ui.cancel.setChecked(config.setting[CANCEL])
+        self.ui.max_workers.setValue(config.setting[MAX_WORKERS])
 
     def save(self):
-        config.setting[OPT_MATCH_PAIRS] = self.ui.tag_cleaner_replacement_pairs.toPlainText()
-        config.setting[OPT_MATCH_FIRST] = self.ui.tag_cleaner_first_match_only.isChecked()
-        config.setting[OPT_MATCH_ENABLED] = self.ui.cb_enable_tag_cleaner.isChecked()
-        config.setting[OPT_MATCH_REGEX] = self.ui.cb_use_regex.isChecked()
-
-        TagCleaner.refresh()
-
-    def _set_enabled_state(self, *args):
-        self.ui.gm_replacement_pairs.setEnabled(self.ui.cb_enable_tag_cleaner.isChecked())
-
-
-def track_tag_cleaner(album, metadata, *args):
-    if not config.setting[OPT_MATCH_ENABLED]:
-        return
-    if 'genre' not in metadata or not metadata['genre']:
-        log.debug("%s: No genres found for: \"%s\"", PLUGIN_NAME, metadata['title'],)
-        return
-    genres = set()
-    metadata_genres = str(metadata['genre']).split(MULTI_VALUED_JOINER)
-    for genre in metadata_genres:
-        for (original, replacement) in TagCleaner.pairs:
-            if genre and re.search(original, genre, re.IGNORECASE):
-                genre = replacement
-                if config.setting[OPT_MATCH_FIRST]:
-                    break
-        if genre:
-            genres.add(genre.title())
-    genres = sorted(genres)
-    log.debug("{0}: Genres updated from {1} to {2}".format(PLUGIN_NAME, metadata_genres, genres,))
-    metadata['genre'] = genres
+        """Saves the actions table items in the settings.
+        """
+        settings = []
+        for column in range(self.ui.table.columnCount()):
+            settings.append([])
+            for row in range(self.ui.table.rowCount()):
+                setting = self.ui.table.item(row, column).text()
+                settings[column].append(setting)
+            config.setting[OPTIONS[column]] = settings[column]
+        config.setting[CANCEL] = self.ui.cancel.isChecked()
+        config.setting[MAX_WORKERS] = self.ui.max_workers.value()
+        action_loader.load_actions()
 
 
-# Register the plugin to run at a LOW priority.
-register_track_metadata_processor(track_tag_cleaner, priority=PluginPriority.LOW)
-register_options_page(TagCleanerOptionsPage)
+class ActionsStatus(QtWidgets.QWidget, Ui_ActionsStatus):
+    """An icon and a label that displays the number of pending actions.
 
-TagCleaner.refresh()
+    The widget is only visible when there are pending actions. This is placed
+    in the statusbar to the left of the other icons.
+    """
+
+    def __init__(self):
+        QtWidgets.QWidget.__init__(self)
+        Ui_ActionsStatus.__init__(self)
+        self.setupUi(self)
+        self.hide()
+
+        # Creates the icon to the right of the label.
+        size = QtCore.QSize(16, 16)
+        icon = QtGui.QIcon(":/images/16x16/applications-system.png")
+        self.label.setPixmap(icon.pixmap(size))
+
+    def update_actions_count(self, count):
+        self.actions_count.setText(f"{count}")
+        self.setVisible(count > 0)
+
+
+action_loader = ActionLoader()
+action_runner = ActionRunner()
+register_album_action(ExecuteAlbumActions())
+register_track_action(ExecuteTrackActions())
+register_options_page(PostTaggingActionsOptions)
