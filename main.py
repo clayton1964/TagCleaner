@@ -1,7 +1,7 @@
-PLUGIN_NAME = "Clayton's Test Plugin"
+PLUGIN_NAME = "TagCleaner"
 PLUGIN_AUTHOR = "Clayton Mattatall"
-PLUGIN_DESCRIPTION = "This plugin is an example"
-PLUGIN_VERSION = '0.01'
+PLUGIN_DESCRIPTION = "Performs maintenance file metadata (tags)"
+PLUGIN_VERSION = '0.00.1'
 PLUGIN_API_VERSIONS = ['2.2']
 PLUGIN_LICENSE = "GPL-2.0-or-later"
 PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
