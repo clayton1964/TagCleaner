@@ -1,30 +1,35 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2024 Giorgio Fontanive (twodoorcoupe)
+# Copyright (C) 2024 Clayton Mattatall
 #
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
+# This program is free software; you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation; either version 2
 # of the License, or (at your option) any later version.
 #
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
 
-PLUGIN_NAME = "Post Tagging Actions"
-PLUGIN_AUTHOR = "Giorgio Fontanive"
+PLUIN_NAME = "Tag Cleaner"
+PLUGIN_AUTHOR = "Clayton Mattatall"
 PLUGIN_DESCRIPTION = """
-This plugin lets you set up actions that run with a context menu click. 
-An action consists in a command line executed for each album or each track along
-with a few options to tweak the behaviour. 
-This can be used to run external programs and pass some variables to it. 
+Have you ever needed to totally erase/remove ALL metadata(tags) from your audio files?
+What about correcting non-compliant metadata within audio files?
+How about software, such as 'Station Playlist' that will write APEv2 tags with new data but completely ignores
+the fact that it should update existing ID3 tags with the new data. This creates a total mess later since you
+do NOT know which tags are the most up-to-date.
+There are many apps out there that 'butcher' audio files when adding metadata to them. This includes such actions
+as adding the wrong type of metadata frames to the respective audio files.
+
+This plugin's aim is to perform different types of 'cleaning' on your files. This can be simply checking for
+compliance to established standards, all the way to removing EVERY possible piece of metadata leaving you with
+pure sound data and nothing else.
 """
 PLUGIN_VERSION = "0.1"
 PLUGIN_API_VERSIONS = ["2.10", "2.11"]
 PLUGIN_LICENSE = "GPL-2.0"
-PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-2.0.html"
-PLUGIN_USER_GUIDE_URL = "https://github.com/metabrainz/picard-plugins/tree/2.0/plugins/post_tagging_actions/docs/guide.md"
+PLUGIN_LICENSE_URL = "https://www.gnu.org/licenses/gpl-3.0.html"
+PLUGIN_USER_GUIDE_URL = "https://github.com/clayton1964/TagCleaner/blob/master/README.md"
 
 from picard.album import Album
 from picard.track import Track
